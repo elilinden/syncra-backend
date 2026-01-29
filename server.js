@@ -1,230 +1,397 @@
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const cors = require('cors');
-const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
+/**
+ * Syncra Backend (Express + Plaid + Postgres)
+ * - Safer Postgres SSL handling (prod vs local)
+ * - Uses express.json instead of body-parser
+ * - Supports multiple end-users via x-user-id header (defaults to syncra_user_001)
+ * - Paginates Plaid transactions so you don’t silently miss results
+ * - Uses newer Plaid personal_finance_category when available
+ * - Sorts merged transactions by date desc
+ */
+
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const { Configuration, PlaidApi, PlaidEnvironments } = require("plaid");
+const { Pool } = require("pg");
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
 
-// 1. Setup Dynamic Plaid Configuration
+/** ----------------------------
+ *  Basic middleware
+ *  ---------------------------- */
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",") : "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-user-id"],
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
+
+/** ----------------------------
+ *  Helpers
+ *  ---------------------------- */
+function getUserId(req) {
+  // Until you add auth, this is a clean way to test multiple users.
+  // You can pass a header: x-user-id: someUser123
+  return (req.header("x-user-id") || "syncra_user_001").trim();
+}
+
+function requireEnv(name) {
+  if (!process.env[name]) {
+    throw new Error(`Missing required env var: ${name}`);
+  }
+}
+
+/** ----------------------------
+ *  PostgreSQL
+ *  ---------------------------- */
+const isProd = process.env.NODE_ENV === "production";
+
+// Render typically needs SSL; local dev often does NOT.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: isProd ? { rejectUnauthorized: false } : false,
+});
+
+// Create table if missing
+async function initDb() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bank_tokens (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        access_token TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (access_token)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bank_tokens_user_id ON bank_tokens(user_id);`);
+    console.log("✅ Database table 'bank_tokens' is ready.");
+  } catch (err) {
+    console.error("❌ Database Init Error:", err.message);
+  }
+}
+initDb();
+
+/** ----------------------------
+ *  Plaid client
+ *  ---------------------------- */
+try {
+  requireEnv("PLAID_CLIENT_ID");
+  requireEnv("PLAID_SECRET");
+} catch (e) {
+  // Don’t crash on boot in case you're deploying and setting env later,
+  // but DO make it obvious in logs.
+  console.error("❌ ENV CONFIG ERROR:", e.message);
+}
+
+const plaidEnv = (process.env.PLAID_ENV || "sandbox").toLowerCase();
+const basePath = PlaidEnvironments[plaidEnv] || PlaidEnvironments.sandbox;
+
 const configuration = new Configuration({
-  basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
+  basePath,
   baseOptions: {
     headers: {
-      'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
-      'PLAID-SECRET': process.env.PLAID_SECRET,
+      "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID || "",
+      "PLAID-SECRET": process.env.PLAID_SECRET || "",
+      // Optional but recommended — set if you want:
+      ...(process.env.PLAID_VERSION ? { "Plaid-Version": process.env.PLAID_VERSION } : {}),
     },
   },
 });
+
 const plaidClient = new PlaidApi(configuration);
 
-// --- GLOBAL STORAGE ---
-if (!global.ACCESS_TOKENS) {
-  global.ACCESS_TOKENS = [];
+/** ----------------------------
+ *  Apple Universal Links (AASA)
+ *  ---------------------------- */
+app.get("/.well-known/apple-app-site-association", (req, res) => {
+  res.set("Content-Type", "application/json");
+  res.status(200).send(
+    JSON.stringify(
+      {
+        applinks: {
+          apps: [],
+          details: [
+            {
+              appID: "FYGW4LHN42.com.elilindenDinematch.Syncra",
+              paths: ["/*"],
+            },
+          ],
+        },
+      },
+      null,
+      2
+    )
+  );
+});
+
+/** ----------------------------
+ *  Plaid helpers
+ *  ---------------------------- */
+async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
+  // Plaid returns max 500 per page depending on endpoint versions; using 100 is safe.
+  const pageSize = 100;
+  let offset = 0;
+  let allTransactions = [];
+  let accountsMap = {};
+
+  while (true) {
+    const resp = await plaidClient.transactionsGet({
+      access_token: accessToken,
+      start_date: startDate,
+      end_date: endDate,
+      options: { count: pageSize, offset },
+    });
+
+    // Map accounts -> name/mask for enrichment
+    for (const acc of resp.data.accounts || []) {
+      accountsMap[acc.account_id] = acc;
+    }
+
+    allTransactions = allTransactions.concat(resp.data.transactions || []);
+
+    const total = resp.data.total_transactions || allTransactions.length;
+    if (allTransactions.length >= total) break;
+
+    offset += pageSize;
+  }
+
+  // Enrich
+  const enriched = allTransactions.map((t) => {
+    const account = accountsMap[t.account_id];
+
+    const category =
+      t.personal_finance_category?.primary ||
+      (Array.isArray(t.category) && t.category.length ? t.category[0] : null) ||
+      "General";
+
+    return {
+      id: t.transaction_id,
+      merchantName: t.merchant_name || t.name,
+      amount: t.amount,
+      date: t.date, // YYYY-MM-DD
+      pending: !!t.pending,
+      category,
+      accountName: account ? account.official_name || account.name : "Unknown",
+      accountMask: account ? account.mask || "0000" : "0000",
+      accountType: account ? account.type : undefined,
+    };
+  });
+
+  return enriched;
 }
 
-// --- NEW: APPLE UNIVERSAL LINKS ---
-// This file tells Apple: "If a user clicks this HTTPS link, open the Syncra App"
-app.get('/.well-known/apple-app-site-association', (req, res) => {
-    res.set('Content-Type', 'application/json');
-    res.json({
-        "applinks": {
-            "apps": [],
-            "details": [
-                {
-                    "appID": "FYGW4LHN42.com.elilindenDinematch.Syncra",
-                    "paths": [ "/*" ]
-                }
-            ]
-        }
-    });
-});
+/** ----------------------------
+ *  Routes
+ *  ---------------------------- */
 
-// --- API ENDPOINTS ---
+// Quick root ping
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "syncra-backend" });
+});
 
 // A. Create Link Token
-app.get('/api/create_link_token', async (req, res) => {
+app.get("/api/create_link_token", async (req, res) => {
   try {
-    const response = await plaidClient.linkTokenCreate({
-      user: { client_user_id: 'syncra_user_001' },
-      client_name: 'Syncra',
-      products: ['transactions'],
-      country_codes: ['US'],
-      language: 'en',
-      // Ensure this matches your Render Environment Variables exactly
-      redirect_uri: process.env.PLAID_REDIRECT_URI, 
-    });
+    const userId = getUserId(req);
+
+    const createArgs = {
+      user: { client_user_id: userId },
+      client_name: "Syncra",
+      products: ["transactions"],
+      country_codes: ["US"],
+      language: "en",
+    };
+
+    // Only include redirect_uri if you set it
+    if (process.env.PLAID_REDIRECT_URI) {
+      createArgs.redirect_uri = process.env.PLAID_REDIRECT_URI;
+    }
+
+    const response = await plaidClient.linkTokenCreate(createArgs);
     res.json({ link_token: response.data.link_token });
   } catch (error) {
-    console.error("Link Token Error:", error.response ? error.response.data : error.message);
-    res.status(500).json({ error: error.message });
+    const details = error?.response?.data || error.message;
+    console.error("Link Token Error:", details);
+    res.status(500).json({ error: "Failed to create link token", details });
   }
 });
 
-// B. Exchange Token
-app.post('/api/exchange_public_token', async (req, res) => {
+// B. Exchange public_token -> access_token (SAVES to Database)
+app.post("/api/exchange_public_token", async (req, res) => {
   try {
-    const response = await plaidClient.itemPublicTokenExchange({
-      public_token: req.body.public_token,
-    });
-    
-    const newToken = response.data.access_token;
-    
-    // Prevent duplicates
-    if (!global.ACCESS_TOKENS.includes(newToken)) {
-      global.ACCESS_TOKENS.push(newToken);
-      console.log(`New Bank Linked. Total connected banks: ${global.ACCESS_TOKENS.length}`);
-    } else {
-        console.log("Bank already linked.");
+    const userId = getUserId(req);
+    const { public_token } = req.body || {};
+
+    if (!public_token) {
+      return res.status(400).json({ error: "Missing public_token" });
     }
 
+    const response = await plaidClient.itemPublicTokenExchange({ public_token });
+    const newToken = response.data.access_token;
+
+    await pool.query(
+      `INSERT INTO bank_tokens (user_id, access_token)
+       VALUES ($1, $2)
+       ON CONFLICT (access_token) DO NOTHING`,
+      [userId, newToken]
+    );
+
+    console.log(`✅ New bank linked for user=${userId} and saved to DB.`);
     res.json({ success: true });
   } catch (error) {
-    console.error("Exchange Error:", error.response ? error.response.data : error.message);
-    res.status(500).json({ error: error.message });
+    const details = error?.response?.data || error.message;
+    console.error("Exchange Error:", details);
+    res.status(500).json({ error: "Failed to exchange public token", details });
   }
 });
 
-// C. Get Transactions (Merged)
-app.get('/api/transactions', async (req, res) => {
-  if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
-      return res.status(400).json({ error: "No active bank links found" });
-  }
-  
-  const now = new Date();
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(now.getDate() - 30);
-  
-  let mergedTransactions = [];
-  
+// C. Get Transactions (FETCHES from Database + paginates Plaid)
+app.get("/api/transactions", async (req, res) => {
   try {
-    const promises = global.ACCESS_TOKENS.map(async (token) => {
-        const response = await plaidClient.transactionsGet({
-            access_token: token,
-            start_date: thirtyDaysAgo.toISOString().split('T')[0],
-            end_date: now.toISOString().split('T')[0],
-        });
-        
-        const accountsMap = {};
-        response.data.accounts.forEach(acc => {
-            accountsMap[acc.account_id] = acc;
-        });
+    const userId = getUserId(req);
 
-        return response.data.transactions.map(t => {
-            const account = accountsMap[t.account_id];
-            return {
-                id: t.transaction_id,
-                merchantName: t.merchant_name || t.name,
-                amount: t.amount,
-                date: t.date,
-                category: t.category ? t.category[0] : "General",
-                accountName: account ? account.name : "Unknown",
-                accountMask: account ? account.mask : "0000"
-            };
-        });
+    const result = await pool.query(
+      "SELECT access_token FROM bank_tokens WHERE user_id = $1",
+      [userId]
+    );
+    const tokens = result.rows.map((row) => row.access_token);
+
+    if (tokens.length === 0) {
+      return res.json({ transactions: [], message: "No active bank links found" });
+    }
+
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const startDate = thirtyDaysAgo.toISOString().split("T")[0];
+    const endDate = now.toISOString().split("T")[0];
+
+    const perTokenResults = await Promise.all(
+      tokens.map(async (token) => {
+        try {
+          return await fetchAllTransactionsForToken(token, startDate, endDate);
+        } catch (err) {
+          const details = err?.response?.data || err.message;
+          console.error("Error fetching transactions for a token:", details);
+          return [];
+        }
+      })
+    );
+
+    let merged = perTokenResults.flat();
+
+    // Sort by date desc (and stable-ish by amount)
+    merged.sort((a, b) => {
+      if (a.date === b.date) return (b.amount || 0) - (a.amount || 0);
+      return a.date < b.date ? 1 : -1;
     });
 
-    const results = await Promise.all(promises);
-    results.forEach(bankTransactions => {
-        mergedTransactions = mergedTransactions.concat(bankTransactions);
+    res.json({
+      transactions: merged,
+      lastSynced: new Date().toISOString(),
     });
-    
-    res.json({ 
-      transactions: mergedTransactions,
-      lastSynced: new Date().toISOString() 
-    });
-
   } catch (error) {
-    console.error("Transaction Error:", error.response ? error.response.data : error.message);
-    res.status(500).json({ error: error.message });
+    const details = error?.response?.data || error.message;
+    console.error("Transaction Error:", details);
+    res.status(500).json({ error: "Failed to fetch transactions", details });
   }
 });
 
-// D. Get Accounts (Merged)
-app.get('/api/accounts', async (req, res) => {
-    if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
-        return res.json({ accounts: [] });
-    }
+// D. Get Accounts (FETCHES from Database)
+app.get("/api/accounts", async (req, res) => {
+  try {
+    const userId = getUserId(req);
 
-    try {
-        const promises = global.ACCESS_TOKENS.map(async (token) => {
-            const response = await plaidClient.accountsGet({ access_token: token });
-            return response.data.accounts.map(a => ({
-                id: a.account_id,
-                name: a.name,
-                mask: a.mask,
-                balance: a.balances.current,
-                type: a.type
-            }));
-        });
+    const result = await pool.query(
+      "SELECT access_token FROM bank_tokens WHERE user_id = $1",
+      [userId]
+    );
+    const tokens = result.rows.map((row) => row.access_token);
 
-        const results = await Promise.all(promises);
-        res.json({ accounts: results.flat() });
-    } catch (error) {
-        console.error("Accounts Error:", error.response ? error.response.data : error.message);
-        res.status(500).json({ error: error.message });
-    }
+    if (tokens.length === 0) return res.json({ accounts: [] });
+
+    const perTokenAccounts = await Promise.all(
+      tokens.map(async (token) => {
+        try {
+          const response = await plaidClient.accountsGet({ access_token: token });
+          return (response.data.accounts || []).map((a) => ({
+            id: a.account_id,
+            name: a.official_name || a.name,
+            mask: a.mask,
+            balance: a.balances?.current,
+            available: a.balances?.available,
+            type: a.type,
+            subtype: a.subtype,
+          }));
+        } catch (err) {
+          const details = err?.response?.data || err.message;
+          console.error("Accounts fetch error for a token:", details);
+          return [];
+        }
+      })
+    );
+
+    res.json({ accounts: perTokenAccounts.flat() });
+  } catch (error) {
+    const details = error?.response?.data || error.message;
+    console.error("Accounts Error:", details);
+    res.status(500).json({ error: "Failed to fetch accounts", details });
+  }
 });
 
 // E. Health Check
-app.get('/api/status', (req, res) => {
-  res.json({ 
-    status: "online", 
-    environment: process.env.PLAID_ENV || 'sandbox',
-    banks_connected: global.ACCESS_TOKENS ? global.ACCESS_TOKENS.length : 0
-  });
+app.get("/api/status", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const result = await pool.query(
+      "SELECT COUNT(*) FROM bank_tokens WHERE user_id = $1",
+      [userId]
+    );
+
+    res.json({
+      status: "online",
+      database: "connected",
+      user_id: userId,
+      banks_connected: parseInt(result.rows[0].count, 10),
+    });
+  } catch (err) {
+    res.status(500).json({ status: "degraded", error: err.message });
+  }
 });
 
-// F. Unlink All (Wipe Everything)
-app.post('/api/unlink', (req, res) => {
-    global.ACCESS_TOKENS = [];
-    console.log("All banks unlinked.");
+// F. Unlink All (Wipes DB for this user)
+app.post("/api/unlink", async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    await pool.query("DELETE FROM bank_tokens WHERE user_id = $1", [userId]);
+    console.log(`✅ All banks unlinked for user=${userId}.`);
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to unlink banks", details: err.message });
+  }
 });
 
-// G. List Connected Institutions
-app.get('/api/institutions', async (req, res) => {
-    if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
-        return res.json({ institutions: [] });
-    }
-    try {
-        const promises = global.ACCESS_TOKENS.map(async (token, index) => {
-            try {
-                const itemResponse = await plaidClient.itemGet({ access_token: token });
-                const instId = itemResponse.data.item.institution_id;
-                if (instId) {
-                    const instResponse = await plaidClient.institutionsGetById({
-                        institution_id: instId,
-                        country_codes: ['US']
-                    });
-                    return { id: index, name: instResponse.data.institution.name };
-                }
-                return { id: index, name: "Unknown Bank" };
-            } catch (err) {
-                return { id: index, name: "Bank Connection Error" };
-            }
-        });
-        const institutions = await Promise.all(promises);
-        res.json({ institutions });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+/** ----------------------------
+ *  Shutdown safety
+ *  ---------------------------- */
+process.on("SIGTERM", async () => {
+  try {
+    await pool.end();
+  } finally {
+    process.exit(0);
+  }
 });
 
-// H. Delete Specific Bank
-app.post('/api/delete_institution', (req, res) => {
-    const { index } = req.body;
-    if (index !== undefined && index >= 0 && index < global.ACCESS_TOKENS.length) {
-        global.ACCESS_TOKENS.splice(index, 1);
-        res.json({ success: true });
-    } else {
-        res.status(400).json({ error: "Invalid index" });
-    }
-});
-
+/** ----------------------------
+ *  Start server
+ *  ---------------------------- */
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(`Syncra Backend: Running on port ${PORT}`);
+  console.log(`🚀 Syncra Backend running on port ${PORT} (env=${plaidEnv}, prod=${isProd})`);
 });

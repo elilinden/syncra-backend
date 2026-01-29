@@ -8,9 +8,10 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1. Setup Plaid Configuration
+// 1. Setup Dynamic Plaid Configuration
 const configuration = new Configuration({
-  basePath: PlaidEnvironments.sandbox,
+  // Dynamically switches between 'sandbox' and 'production' based on Render settings
+  basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
   baseOptions: {
     headers: {
       'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
@@ -26,7 +27,7 @@ const plaidClient = new PlaidApi(configuration);
 app.get('/api/create_link_token', async (req, res) => {
   try {
     const response = await plaidClient.linkTokenCreate({
-      user: { client_user_id: 'user_good' },
+      user: { client_user_id: 'syncra_user_001' },
       client_name: 'Syncra',
       products: ['transactions'],
       country_codes: ['US'],
@@ -41,13 +42,15 @@ app.get('/api/create_link_token', async (req, res) => {
 });
 
 // B. Exchange Token
+// NOTE: Using a global variable for the token works for solo testing, 
+// but will mix up data if multiple people use the app.
 app.post('/api/exchange_public_token', async (req, res) => {
   try {
     const response = await plaidClient.itemPublicTokenExchange({
       public_token: req.body.public_token,
     });
     global.ACCESS_TOKEN = response.data.access_token;
-    console.log("Access Token Stored:", global.ACCESS_TOKEN);
+    console.log("Access Token securely stored for session");
     res.json({ success: true });
   } catch (error) {
     console.error("Exchange Error:", error.response ? error.response.data : error.message);
@@ -55,9 +58,9 @@ app.post('/api/exchange_public_token', async (req, res) => {
   }
 });
 
-// C. Get Transactions (Updated to include Account Info)
+// C. Get Transactions
 app.get('/api/transactions', async (req, res) => {
-  if (!global.ACCESS_TOKEN) return res.status(400).json({ error: "Not logged in" });
+  if (!global.ACCESS_TOKEN) return res.status(400).json({ error: "No active bank link found" });
   
   const now = new Date();
   const thirtyDaysAgo = new Date();
@@ -70,13 +73,11 @@ app.get('/api/transactions', async (req, res) => {
       end_date: now.toISOString().split('T')[0],
     });
     
-    // 1. Create a lookup map of Accounts (ID -> Account Details)
     const accountsMap = {};
     response.data.accounts.forEach(acc => {
       accountsMap[acc.account_id] = acc;
     });
     
-    // 2. Format transactions and attach account info
     const transactions = response.data.transactions.map(t => {
       const account = accountsMap[t.account_id];
       return {
@@ -85,7 +86,6 @@ app.get('/api/transactions', async (req, res) => {
         amount: t.amount,
         date: t.date,
         category: t.category ? t.category[0] : "General",
-        // NEW: Attach account name and mask
         accountName: account ? account.name : "Unknown",
         accountMask: account ? account.mask : "0000"
       };
@@ -112,10 +112,21 @@ app.get('/api/accounts', async (req, res) => {
     }));
     res.json({ accounts });
   } catch (error) {
+    console.error("Accounts Error:", error.response ? error.response.data : error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(8000, () => {
-  console.log('Syncra Backend running on port 8000');
+// E. Health Check (Helps verify server status in browser)
+app.get('/api/status', (req, res) => {
+  res.json({ 
+    status: "online", 
+    environment: process.env.PLAID_ENV || 'sandbox' 
+  });
+});
+
+const PORT = process.env.PORT || 8000;
+app.listen(PORT, () => {
+  console.log(`Syncra Backend: Running on port ${PORT}`);
+  console.log(`Syncra Backend: Plaid initialized in ${process.env.PLAID_ENV || 'sandbox'} mode.`);
 });

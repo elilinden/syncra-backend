@@ -20,8 +20,9 @@ const configuration = new Configuration({
 });
 const plaidClient = new PlaidApi(configuration);
 
-// --- GLOBAL STORAGE (Multi-Bank Support) ---
-// We now store an ARRAY of tokens to support connecting multiple banks at once.
+// --- GLOBAL STORAGE ---
+// We use a global array to store tokens in memory.
+// Note: If the server restarts (Render free tier sleeps), this list is wiped.
 if (!global.ACCESS_TOKENS) {
   global.ACCESS_TOKENS = [];
 }
@@ -37,7 +38,6 @@ app.get('/api/create_link_token', async (req, res) => {
       products: ['transactions'],
       country_codes: ['US'],
       language: 'en',
-      // Ensure this matches your Render Environment Variables exactly
       redirect_uri: process.env.PLAID_REDIRECT_URI, 
     });
     res.json({ link_token: response.data.link_token });
@@ -47,7 +47,7 @@ app.get('/api/create_link_token', async (req, res) => {
   }
 });
 
-// B. Exchange Token (Adds to the list instead of overwriting)
+// B. Exchange Token
 app.post('/api/exchange_public_token', async (req, res) => {
   try {
     const response = await plaidClient.itemPublicTokenExchange({
@@ -56,7 +56,7 @@ app.post('/api/exchange_public_token', async (req, res) => {
     
     const newToken = response.data.access_token;
     
-    // Prevent duplicates: Only add if we don't have it already
+    // Prevent duplicates
     if (!global.ACCESS_TOKENS.includes(newToken)) {
       global.ACCESS_TOKENS.push(newToken);
       console.log(`New Bank Linked. Total connected banks: ${global.ACCESS_TOKENS.length}`);
@@ -71,9 +71,8 @@ app.post('/api/exchange_public_token', async (req, res) => {
   }
 });
 
-// C. Get Transactions (Loops through ALL banks and merges data)
+// C. Get Transactions (Merged)
 app.get('/api/transactions', async (req, res) => {
-  // 1. Check if we have ANY banks linked
   if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
       return res.status(400).json({ error: "No active bank links found" });
   }
@@ -85,7 +84,6 @@ app.get('/api/transactions', async (req, res) => {
   let mergedTransactions = [];
   
   try {
-    // 2. Loop through every token (Promise.all for speed)
     const promises = global.ACCESS_TOKENS.map(async (token) => {
         const response = await plaidClient.transactionsGet({
             access_token: token,
@@ -93,13 +91,11 @@ app.get('/api/transactions', async (req, res) => {
             end_date: now.toISOString().split('T')[0],
         });
         
-        // Map accounts for THIS specific bank
         const accountsMap = {};
         response.data.accounts.forEach(acc => {
             accountsMap[acc.account_id] = acc;
         });
 
-        // Format Transactions
         return response.data.transactions.map(t => {
             const account = accountsMap[t.account_id];
             return {
@@ -114,15 +110,11 @@ app.get('/api/transactions', async (req, res) => {
         });
     });
 
-    // 3. Wait for all banks to reply
     const results = await Promise.all(promises);
-
-    // 4. Merge results into one big list
     results.forEach(bankTransactions => {
         mergedTransactions = mergedTransactions.concat(bankTransactions);
     });
     
-    // 5. Send the combined list
     res.json({ 
       transactions: mergedTransactions,
       lastSynced: new Date().toISOString() 
@@ -134,7 +126,7 @@ app.get('/api/transactions', async (req, res) => {
   }
 });
 
-// D. Get Accounts (Merged from all banks)
+// D. Get Accounts (Merged)
 app.get('/api/accounts', async (req, res) => {
     if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
         return res.json({ accounts: [] });
@@ -153,9 +145,7 @@ app.get('/api/accounts', async (req, res) => {
         });
 
         const results = await Promise.all(promises);
-        const allAccounts = results.flat(); // Flattens array of arrays
-
-        res.json({ accounts: allAccounts });
+        res.json({ accounts: results.flat() });
     } catch (error) {
         console.error("Accounts Error:", error.response ? error.response.data : error.message);
         res.status(500).json({ error: error.message });
@@ -171,11 +161,60 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// F. Unlink (Clears ALL banks)
+// F. Unlink All (Wipe Everything)
 app.post('/api/unlink', (req, res) => {
     global.ACCESS_TOKENS = [];
     console.log("All banks unlinked.");
     res.json({ success: true });
+});
+
+// G. NEW: List Connected Institutions (Names & IDs)
+app.get('/api/institutions', async (req, res) => {
+    if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
+        return res.json({ institutions: [] });
+    }
+    try {
+        // Loop through tokens and fetch Item Metadata for each
+        const promises = global.ACCESS_TOKENS.map(async (token, index) => {
+            try {
+                // 1. Get Item info to find Institution ID
+                const itemResponse = await plaidClient.itemGet({ access_token: token });
+                const instId = itemResponse.data.item.institution_id;
+                
+                // 2. Get readable Bank Name (e.g. "Chase")
+                if (instId) {
+                    const instResponse = await plaidClient.institutionsGetById({
+                        institution_id: instId,
+                        country_codes: ['US']
+                    });
+                    return { id: index, name: instResponse.data.institution.name };
+                }
+                return { id: index, name: "Unknown Bank" };
+            } catch (err) {
+                console.error("Error fetching institution name:", err.message);
+                return { id: index, name: "Bank Connection Error" };
+            }
+        });
+        
+        const institutions = await Promise.all(promises);
+        res.json({ institutions });
+    } catch (error) {
+        console.error("Institutions API Error:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// H. NEW: Delete Specific Bank
+app.post('/api/delete_institution', (req, res) => {
+    const { index } = req.body;
+    if (index !== undefined && index >= 0 && index < global.ACCESS_TOKENS.length) {
+        // Remove the token at that index
+        global.ACCESS_TOKENS.splice(index, 1);
+        console.log(`Bank at index ${index} removed.`);
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ error: "Invalid index" });
+    }
 });
 
 const PORT = process.env.PORT || 8000;

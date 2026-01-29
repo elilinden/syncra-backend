@@ -15,7 +15,7 @@ const configuration = new Configuration({
   baseOptions: {
     headers: {
       'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
-      'PLAID-SECRET': process.env.PLAID_SECRET,
+      'PLAID-SECRET': process.env.PLAID_SECRET, // Your production secret from Render
     },
   },
 });
@@ -42,8 +42,6 @@ app.get('/api/create_link_token', async (req, res) => {
 });
 
 // B. Exchange Token
-// NOTE: Using a global variable for the token works for solo testing, 
-// but will mix up data if multiple people use the app.
 app.post('/api/exchange_public_token', async (req, res) => {
   try {
     const response = await plaidClient.itemPublicTokenExchange({
@@ -58,7 +56,7 @@ app.post('/api/exchange_public_token', async (req, res) => {
   }
 });
 
-// C. Get Transactions
+// C. Get Transactions (Includes a timestamp for mobile caching)
 app.get('/api/transactions', async (req, res) => {
   if (!global.ACCESS_TOKEN) return res.status(400).json({ error: "No active bank link found" });
   
@@ -91,7 +89,11 @@ app.get('/api/transactions', async (req, res) => {
       };
     });
     
-    res.json({ transactions });
+    // Returning the timestamp so mobile knows when this specific pull happened
+    res.json({ 
+      transactions, 
+      lastSynced: new Date().toISOString() 
+    });
   } catch (error) {
     console.error("Transaction Error:", error.response ? error.response.data : error.message);
     res.status(500).json({ error: error.message });
@@ -117,7 +119,7 @@ app.get('/api/accounts', async (req, res) => {
   }
 });
 
-// E. Health Check (Helps verify server status in browser)
+// E. Health Check
 app.get('/api/status', (req, res) => {
   res.json({ 
     status: "online", 

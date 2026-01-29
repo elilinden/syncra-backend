@@ -21,11 +21,26 @@ const configuration = new Configuration({
 const plaidClient = new PlaidApi(configuration);
 
 // --- GLOBAL STORAGE ---
-// We use a global array to store tokens in memory.
-// Note: If the server restarts (Render free tier sleeps), this list is wiped.
 if (!global.ACCESS_TOKENS) {
   global.ACCESS_TOKENS = [];
 }
+
+// --- NEW: APPLE UNIVERSAL LINKS ---
+// This file tells Apple: "If a user clicks this HTTPS link, open the Syncra App"
+app.get('/.well-known/apple-app-site-association', (req, res) => {
+    res.set('Content-Type', 'application/json');
+    res.json({
+        "applinks": {
+            "apps": [],
+            "details": [
+                {
+                    "appID": "FYGW4LHN42.com.elilindenDinematch.Syncra",
+                    "paths": [ "/*" ]
+                }
+            ]
+        }
+    });
+});
 
 // --- API ENDPOINTS ---
 
@@ -38,6 +53,7 @@ app.get('/api/create_link_token', async (req, res) => {
       products: ['transactions'],
       country_codes: ['US'],
       language: 'en',
+      // Ensure this matches your Render Environment Variables exactly
       redirect_uri: process.env.PLAID_REDIRECT_URI, 
     });
     res.json({ link_token: response.data.link_token });
@@ -168,20 +184,16 @@ app.post('/api/unlink', (req, res) => {
     res.json({ success: true });
 });
 
-// G. NEW: List Connected Institutions (Names & IDs)
+// G. List Connected Institutions
 app.get('/api/institutions', async (req, res) => {
     if (!global.ACCESS_TOKENS || global.ACCESS_TOKENS.length === 0) {
         return res.json({ institutions: [] });
     }
     try {
-        // Loop through tokens and fetch Item Metadata for each
         const promises = global.ACCESS_TOKENS.map(async (token, index) => {
             try {
-                // 1. Get Item info to find Institution ID
                 const itemResponse = await plaidClient.itemGet({ access_token: token });
                 const instId = itemResponse.data.item.institution_id;
-                
-                // 2. Get readable Bank Name (e.g. "Chase")
                 if (instId) {
                     const instResponse = await plaidClient.institutionsGetById({
                         institution_id: instId,
@@ -191,26 +203,21 @@ app.get('/api/institutions', async (req, res) => {
                 }
                 return { id: index, name: "Unknown Bank" };
             } catch (err) {
-                console.error("Error fetching institution name:", err.message);
                 return { id: index, name: "Bank Connection Error" };
             }
         });
-        
         const institutions = await Promise.all(promises);
         res.json({ institutions });
     } catch (error) {
-        console.error("Institutions API Error:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-// H. NEW: Delete Specific Bank
+// H. Delete Specific Bank
 app.post('/api/delete_institution', (req, res) => {
     const { index } = req.body;
     if (index !== undefined && index >= 0 && index < global.ACCESS_TOKENS.length) {
-        // Remove the token at that index
         global.ACCESS_TOKENS.splice(index, 1);
-        console.log(`Bank at index ${index} removed.`);
         res.json({ success: true });
     } else {
         res.status(400).json({ error: "Invalid index" });
@@ -220,5 +227,4 @@ app.post('/api/delete_institution', (req, res) => {
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
   console.log(`Syncra Backend: Running on port ${PORT}`);
-  console.log(`Syncra Backend: Plaid initialized in ${process.env.PLAID_ENV || 'sandbox'} mode.`);
 });

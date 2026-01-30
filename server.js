@@ -14,7 +14,7 @@ const { Configuration, PlaidApi, PlaidEnvironments } = require("plaid");
 const { Pool } = require("pg");
 
 const jwt = require("jsonwebtoken");
-const jwkToPem = require("jwk-to-pem");
+const jwksClient = require("jwks-rsa");
 
 const app = express();
 
@@ -46,13 +46,20 @@ const APPLE_ISSUER = "https://appleid.apple.com";
 const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || ""; // iOS bundle id
 const SYNCRA_JWT_SECRET = process.env.SYNCRA_JWT_SECRET || "";
 
-if (isProd) {
-  try {
+try {
+  // You need these in prod AND realistically in dev too for Apple auth to work.
+  // (We don't hard-crash in dev to keep local work easier.)
+  if (isProd) {
     requireEnv("APPLE_CLIENT_ID");
     requireEnv("SYNCRA_JWT_SECRET");
-  } catch (e) {
-    console.error("❌ ENV CONFIG ERROR:", e.message);
+    requireEnv("DATABASE_URL");
+    requireEnv("PLAID_CLIENT_ID");
+    requireEnv("PLAID_SECRET");
+    requireEnv("PLAID_ENV");
+    requireEnv("PLAID_REDIRECT_URI");
   }
+} catch (e) {
+  console.error("❌ ENV CONFIG ERROR:", e.message);
 }
 
 /** ----------------------------
@@ -98,15 +105,6 @@ initDb();
 /** ----------------------------
  *  Plaid client
  *  ---------------------------- */
-try {
-  requireEnv("PLAID_CLIENT_ID");
-  requireEnv("PLAID_SECRET");
-  requireEnv("PLAID_ENV");
-  requireEnv("PLAID_REDIRECT_URI");
-} catch (e) {
-  console.error("❌ ENV CONFIG ERROR:", e.message);
-}
-
 const plaidEnv = (process.env.PLAID_ENV || "sandbox").toLowerCase();
 const basePath = PlaidEnvironments[plaidEnv] || PlaidEnvironments.sandbox;
 
@@ -133,6 +131,7 @@ const AASA_JSON = {
     apps: [],
     details: [
       {
+        // TeamID.BundleID
         appID: "FYGW4LHN42.com.elilindenDinematch.Syncra",
         paths: ["/plaid/*"],
       },
@@ -173,48 +172,50 @@ app.get("/plaid/oauth.html", (req, res) => {
 });
 
 /** ----------------------------
- *  Sign in with Apple verification
+ *  Sign in with Apple verification (jwks-rsa)
  *  ---------------------------- */
-let appleKeyCache = { keys: null, fetchedAt: 0 };
+const appleJwks = jwksClient({
+  jwksUri: "https://appleid.apple.com/auth/keys",
+  cache: true,
+  cacheMaxEntries: 5,
+  cacheMaxAge: 10 * 60 * 1000, // 10 minutes
+  rateLimit: true,
+  jwksRequestsPerMinute: 10,
+});
 
-async function fetchAppleKeys() {
-  const now = Date.now();
-  // cache for 6 hours
-  if (appleKeyCache.keys && now - appleKeyCache.fetchedAt < 6 * 60 * 60 * 1000) {
-    return appleKeyCache.keys;
-  }
-
-  const resp = await fetch("https://appleid.apple.com/auth/keys");
-  if (!resp.ok) throw new Error(`Failed to fetch Apple keys: ${resp.status}`);
-  const data = await resp.json();
-
-  appleKeyCache = { keys: data.keys || [], fetchedAt: now };
-  return appleKeyCache.keys;
+function getAppleSigningKey(header, callback) {
+  appleJwks.getSigningKey(header.kid, (err, key) => {
+    if (err) return callback(err);
+    const pubKey = key.getPublicKey();
+    callback(null, pubKey);
+  });
 }
 
-async function verifyAppleIdentityToken(identityToken) {
-  const decoded = jwt.decode(identityToken, { complete: true });
-  if (!decoded?.header?.kid) throw new Error("Invalid Apple identity token (no kid)");
+function verifyAppleIdentityToken(identityToken) {
+  if (!APPLE_CLIENT_ID) {
+    // In prod this should never happen because we requireEnv above.
+    throw new Error("Missing APPLE_CLIENT_ID");
+  }
 
-  const keys = await fetchAppleKeys();
-  const jwk = keys.find((k) => k.kid === decoded.header.kid);
-  if (!jwk) throw new Error("Apple public key not found for token kid");
-
-  const pem = jwkToPem(jwk);
-
-  const payload = jwt.verify(identityToken, pem, {
-    algorithms: ["RS256"],
-    audience: APPLE_CLIENT_ID || undefined,
-    issuer: APPLE_ISSUER,
+  return new Promise((resolve, reject) => {
+    jwt.verify(
+      identityToken,
+      getAppleSigningKey,
+      {
+        algorithms: ["RS256"],
+        issuer: APPLE_ISSUER,
+        audience: APPLE_CLIENT_ID,
+      },
+      (err, decoded) => {
+        if (err) return reject(err);
+        resolve(decoded);
+      }
+    );
   });
-
-  return payload; // includes sub, email (sometimes), etc.
 }
 
 function signSyncraSession(userId) {
-  if (!SYNCRA_JWT_SECRET) {
-    throw new Error("Missing SYNCRA_JWT_SECRET");
-  }
+  if (!SYNCRA_JWT_SECRET) throw new Error("Missing SYNCRA_JWT_SECRET");
   // 180 days is nice for small friend beta
   return jwt.sign({ sub: userId }, SYNCRA_JWT_SECRET, { expiresIn: "180d" });
 }
@@ -273,7 +274,8 @@ app.post("/api/auth/apple", async (req, res) => {
       `
       INSERT INTO users (user_id, email)
       VALUES ($1, $2)
-      ON CONFLICT (user_id) DO UPDATE SET email = COALESCE(EXCLUDED.email, users.email)
+      ON CONFLICT (user_id) DO UPDATE
+      SET email = COALESCE(EXCLUDED.email, users.email)
       `,
       [userId, email]
     );
@@ -299,7 +301,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
   const pageSize = 100;
   let offset = 0;
   let allTransactions = [];
-  let accountsMap = {};
+  const accountsMap = {};
 
   while (true) {
     const resp = await plaidClient.transactionsGet({
@@ -321,7 +323,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
     offset += pageSize;
   }
 
-  const enriched = allTransactions.map((t) => {
+  return allTransactions.map((t) => {
     const account = accountsMap[t.account_id];
 
     const category =
@@ -341,8 +343,6 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
       accountType: account ? account.type : undefined,
     };
   });
-
-  return enriched;
 }
 
 /** ----------------------------
@@ -389,9 +389,7 @@ app.post("/api/exchange_public_token", async (req, res) => {
     const userId = req.userId;
     const { public_token } = req.body || {};
 
-    if (!public_token) {
-      return res.status(400).json({ error: "Missing public_token" });
-    }
+    if (!public_token) return res.status(400).json({ error: "Missing public_token" });
 
     const response = await plaidClient.itemPublicTokenExchange({ public_token });
     const newToken = response.data.access_token;

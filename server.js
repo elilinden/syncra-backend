@@ -1,12 +1,9 @@
 /**
  * Syncra Backend (Express + Plaid + Postgres)
- * - Safer Postgres SSL handling (prod vs local)
- * - Uses express.json instead of body-parser
- * - Supports multiple end-users via x-user-id header (defaults to syncra_user_001)
- * - Paginates Plaid transactions so you don’t silently miss results
- * - Uses newer Plaid personal_finance_category when available
- * - Sorts merged transactions by date desc
- * - Adds Plaid OAuth redirect page + AASA config for Universal Links
+ * - Multi-user auth via Sign in with Apple (Option B)
+ * - Issues Syncra JWT sessions
+ * - Uses JWT user_id to scope Plaid tokens per user
+ * - Keeps your existing Plaid + AASA + OAuth redirect page behavior
  */
 
 require("dotenv").config();
@@ -16,17 +13,10 @@ const cors = require("cors");
 const { Configuration, PlaidApi, PlaidEnvironments } = require("plaid");
 const { Pool } = require("pg");
 
-const app = express();
+const jwt = require("jsonwebtoken");
+const jwkToPem = require("jwk-to-pem");
 
-/** ----------------------------
- *  CONFIG YOU MUST SET
- *  ---------------------------- */
-/**
- * IMPORTANT:
- * This MUST be exactly: TEAMID.BUNDLEID
- * Example: FYGW4LHN42.com.elilinden.syncra
- */
-const AASA_APP_ID = "FYGW4LHN42.com.elilindenDinematch.Syncra";
+const app = express();
 
 /** ----------------------------
  *  Basic middleware
@@ -44,29 +34,46 @@ app.use(express.json({ limit: "1mb" }));
 /** ----------------------------
  *  Helpers
  *  ---------------------------- */
-function getUserId(req) {
-  return (req.header("x-user-id") || "syncra_user_001").trim();
-}
-
 function requireEnv(name) {
   if (!process.env[name]) {
     throw new Error(`Missing required env var: ${name}`);
   }
 }
 
+const isProd = process.env.NODE_ENV === "production";
+
+const APPLE_ISSUER = "https://appleid.apple.com";
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || ""; // iOS bundle id
+const SYNCRA_JWT_SECRET = process.env.SYNCRA_JWT_SECRET || "";
+
+if (isProd) {
+  try {
+    requireEnv("APPLE_CLIENT_ID");
+    requireEnv("SYNCRA_JWT_SECRET");
+  } catch (e) {
+    console.error("❌ ENV CONFIG ERROR:", e.message);
+  }
+}
+
 /** ----------------------------
  *  PostgreSQL
  *  ---------------------------- */
-const isProd = process.env.NODE_ENV === "production";
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: isProd ? { rejectUnauthorized: false } : false,
 });
 
-// Create table if missing
+// Create tables if missing
 async function initDb() {
   try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        email TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bank_tokens (
         id SERIAL PRIMARY KEY,
@@ -76,10 +83,12 @@ async function initDb() {
         UNIQUE (access_token)
       );
     `);
+
     await pool.query(
       `CREATE INDEX IF NOT EXISTS idx_bank_tokens_user_id ON bank_tokens(user_id);`
     );
-    console.log("✅ Database table 'bank_tokens' is ready.");
+
+    console.log("✅ Database tables are ready.");
   } catch (err) {
     console.error("❌ Database Init Error:", err.message);
   }
@@ -116,44 +125,39 @@ const plaidClient = new PlaidApi(configuration);
 
 /** ----------------------------
  *  Apple Universal Links (AASA)
- *  IMPORTANT: iOS app must include:
+ *  IMPORTANT: Your iOS app must include:
  *  Associated Domains: applinks:syncra-backend-2ox9.onrender.com
  *  ---------------------------- */
-function sendAASA(res) {
-  // Apple prefers application/json and a 200
+const AASA_JSON = {
+  applinks: {
+    apps: [],
+    details: [
+      {
+        appID: "FYGW4LHN42.com.elilindenDinematch.Syncra",
+        paths: ["/plaid/*"],
+      },
+    ],
+  },
+};
+
+app.get("/.well-known/apple-app-site-association", (req, res) => {
   res.set("Content-Type", "application/json");
   res.set("Cache-Control", "no-store");
-  res.status(200).send(
-    JSON.stringify(
-      {
-        applinks: {
-          apps: [],
-          details: [
-            {
-              appID: AASA_APP_ID,
-              paths: ["/plaid/*"],
-            },
-          ],
-        },
-      },
-      null,
-      2
-    )
-  );
-}
+  res.status(200).send(JSON.stringify(AASA_JSON, null, 2));
+});
 
-// Serve at BOTH common AASA locations
-app.get("/.well-known/apple-app-site-association", (req, res) => sendAASA(res));
-app.get("/apple-app-site-association", (req, res) => sendAASA(res));
+// also serve at root path (nice for some validators)
+app.get("/apple-app-site-association", (req, res) => {
+  res.set("Content-Type", "application/json");
+  res.set("Cache-Control", "no-store");
+  res.status(200).send(JSON.stringify(AASA_JSON, null, 2));
+});
 
 /** ----------------------------
  *  Plaid OAuth redirect landing page
- *  Your PLAID_REDIRECT_URI should be:
- *  https://syncra-backend-2ox9.onrender.com/plaid/oauth.html
  *  ---------------------------- */
 app.get("/plaid/oauth.html", (req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
-  res.set("Cache-Control", "no-store");
   res.status(200).send(`<!doctype html>
 <html>
   <head>
@@ -161,11 +165,131 @@ app.get("/plaid/oauth.html", (req, res) => {
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Syncra</title>
   </head>
-  <body style="font-family: -apple-system, system-ui, Arial; padding: 24px;">
+  <body style="font-family:-apple-system,system-ui,Arial;padding:24px;">
     <h3>Returning to Syncra…</h3>
     <p>If you aren’t redirected automatically, close this page and return to the app.</p>
   </body>
 </html>`);
+});
+
+/** ----------------------------
+ *  Sign in with Apple verification
+ *  ---------------------------- */
+let appleKeyCache = { keys: null, fetchedAt: 0 };
+
+async function fetchAppleKeys() {
+  const now = Date.now();
+  // cache for 6 hours
+  if (appleKeyCache.keys && now - appleKeyCache.fetchedAt < 6 * 60 * 60 * 1000) {
+    return appleKeyCache.keys;
+  }
+
+  const resp = await fetch("https://appleid.apple.com/auth/keys");
+  if (!resp.ok) throw new Error(`Failed to fetch Apple keys: ${resp.status}`);
+  const data = await resp.json();
+
+  appleKeyCache = { keys: data.keys || [], fetchedAt: now };
+  return appleKeyCache.keys;
+}
+
+async function verifyAppleIdentityToken(identityToken) {
+  const decoded = jwt.decode(identityToken, { complete: true });
+  if (!decoded?.header?.kid) throw new Error("Invalid Apple identity token (no kid)");
+
+  const keys = await fetchAppleKeys();
+  const jwk = keys.find((k) => k.kid === decoded.header.kid);
+  if (!jwk) throw new Error("Apple public key not found for token kid");
+
+  const pem = jwkToPem(jwk);
+
+  const payload = jwt.verify(identityToken, pem, {
+    algorithms: ["RS256"],
+    audience: APPLE_CLIENT_ID || undefined,
+    issuer: APPLE_ISSUER,
+  });
+
+  return payload; // includes sub, email (sometimes), etc.
+}
+
+function signSyncraSession(userId) {
+  if (!SYNCRA_JWT_SECRET) {
+    throw new Error("Missing SYNCRA_JWT_SECRET");
+  }
+  // 180 days is nice for small friend beta
+  return jwt.sign({ sub: userId }, SYNCRA_JWT_SECRET, { expiresIn: "180d" });
+}
+
+function getUserIdFromAuth(req) {
+  const auth = req.header("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+
+  try {
+    const payload = jwt.verify(m[1], SYNCRA_JWT_SECRET);
+    return payload?.sub || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Auth gate for /api routes
+ * - In prod: requires Bearer token
+ * - In dev: allows x-user-id fallback (or default) to keep you moving fast locally
+ */
+function requireUser(req, res, next) {
+  const userId = getUserIdFromAuth(req);
+
+  if (userId) {
+    req.userId = userId;
+    return next();
+  }
+
+  // dev fallback
+  if (!isProd) {
+    const headerUser = (req.header("x-user-id") || "").trim();
+    req.userId = headerUser || "syncra_user_001";
+    return next();
+  }
+
+  return res.status(401).json({ error: "Unauthorized" });
+}
+
+/** ----------------------------
+ *  AUTH ROUTE: Exchange Apple identity token -> Syncra session token
+ *  ---------------------------- */
+app.post("/api/auth/apple", async (req, res) => {
+  try {
+    const { identity_token } = req.body || {};
+    if (!identity_token) return res.status(400).json({ error: "Missing identity_token" });
+
+    const payload = await verifyAppleIdentityToken(identity_token);
+
+    const userId = payload.sub; // stable per user for your developer team
+    const email = payload.email || null;
+
+    // upsert user record
+    await pool.query(
+      `
+      INSERT INTO users (user_id, email)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id) DO UPDATE SET email = COALESCE(EXCLUDED.email, users.email)
+      `,
+      [userId, email]
+    );
+
+    const token = signSyncraSession(userId);
+
+    res.json({
+      success: true,
+      userId,
+      token,
+      email,
+    });
+  } catch (error) {
+    console.error("Apple Auth Error:", error.message);
+    res.status(401).json({ error: "Apple auth failed", details: error.message });
+  }
 });
 
 /** ----------------------------
@@ -175,7 +299,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
   const pageSize = 100;
   let offset = 0;
   let allTransactions = [];
-  const accountsMap = {};
+  let accountsMap = {};
 
   while (true) {
     const resp = await plaidClient.transactionsGet({
@@ -197,7 +321,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
     offset += pageSize;
   }
 
-  return allTransactions.map((t) => {
+  const enriched = allTransactions.map((t) => {
     const account = accountsMap[t.account_id];
 
     const category =
@@ -217,6 +341,8 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
       accountType: account ? account.type : undefined,
     };
   });
+
+  return enriched;
 }
 
 /** ----------------------------
@@ -228,10 +354,16 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "syncra-backend" });
 });
 
+// Protect all /api/* EXCEPT /api/auth/apple
+app.use("/api", (req, res, next) => {
+  if (req.path === "/auth/apple") return next();
+  return requireUser(req, res, next);
+});
+
 // A. Create Link Token
 app.get("/api/create_link_token", async (req, res) => {
   try {
-    const userId = getUserId(req);
+    const userId = req.userId;
 
     const createArgs = {
       user: { client_user_id: userId },
@@ -254,7 +386,7 @@ app.get("/api/create_link_token", async (req, res) => {
 // B. Exchange public_token -> access_token (SAVES to Database)
 app.post("/api/exchange_public_token", async (req, res) => {
   try {
-    const userId = getUserId(req);
+    const userId = req.userId;
     const { public_token } = req.body || {};
 
     if (!public_token) {
@@ -283,7 +415,7 @@ app.post("/api/exchange_public_token", async (req, res) => {
 // C. Get Transactions
 app.get("/api/transactions", async (req, res) => {
   try {
-    const userId = getUserId(req);
+    const userId = req.userId;
 
     const result = await pool.query(
       "SELECT access_token FROM bank_tokens WHERE user_id = $1",
@@ -314,7 +446,7 @@ app.get("/api/transactions", async (req, res) => {
       })
     );
 
-    const merged = perTokenResults.flat();
+    let merged = perTokenResults.flat();
 
     merged.sort((a, b) => {
       if (a.date === b.date) return (b.amount || 0) - (a.amount || 0);
@@ -335,7 +467,7 @@ app.get("/api/transactions", async (req, res) => {
 // D. Get Accounts
 app.get("/api/accounts", async (req, res) => {
   try {
-    const userId = getUserId(req);
+    const userId = req.userId;
 
     const result = await pool.query(
       "SELECT access_token FROM bank_tokens WHERE user_id = $1",
@@ -374,10 +506,10 @@ app.get("/api/accounts", async (req, res) => {
   }
 });
 
-// E. Health Check
+// E. Health Check (scoped to the current user)
 app.get("/api/status", async (req, res) => {
   try {
-    const userId = getUserId(req);
+    const userId = req.userId;
     const result = await pool.query(
       "SELECT COUNT(*) FROM bank_tokens WHERE user_id = $1",
       [userId]
@@ -397,7 +529,7 @@ app.get("/api/status", async (req, res) => {
 // F. Unlink All
 app.post("/api/unlink", async (req, res) => {
   try {
-    const userId = getUserId(req);
+    const userId = req.userId;
     await pool.query("DELETE FROM bank_tokens WHERE user_id = $1", [userId]);
     console.log(`✅ All banks unlinked for user=${userId}.`);
     res.json({ success: true });
@@ -422,7 +554,5 @@ process.on("SIGTERM", async () => {
  *  ---------------------------- */
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(
-    `🚀 Syncra Backend running on port ${PORT} (plaidEnv=${plaidEnv}, prod=${isProd})`
-  );
+  console.log(`🚀 Syncra Backend running on port ${PORT} (env=${plaidEnv}, prod=${isProd})`);
 });

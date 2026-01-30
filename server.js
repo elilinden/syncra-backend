@@ -5,6 +5,9 @@
  * - Uses JWT user_id to scope Plaid tokens per user
  * - Keeps your existing Plaid + AASA + OAuth redirect page behavior
  * - Adds: /api/institutions + /api/delete_institution for your Settings “Connected Banks”
+ *
+ * IMPROVEMENT:
+ * - Store institution_id + institution_name at link time so bank list always shows real names.
  */
 
 require("dotenv").config();
@@ -48,8 +51,6 @@ const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || ""; // iOS bundle id
 const SYNCRA_JWT_SECRET = process.env.SYNCRA_JWT_SECRET || "";
 
 try {
-  // You need these in prod AND realistically in dev too for Apple auth to work.
-  // (We don't hard-crash in dev to keep local work easier.)
   if (isProd) {
     requireEnv("APPLE_CLIENT_ID");
     requireEnv("SYNCRA_JWT_SECRET");
@@ -71,7 +72,7 @@ const pool = new Pool({
   ssl: isProd ? { rejectUnauthorized: false } : false,
 });
 
-// Create tables if missing
+// Create tables if missing + ensure columns exist
 async function initDb() {
   try {
     await pool.query(`
@@ -92,11 +93,15 @@ async function initDb() {
       );
     `);
 
+    // ✅ Ensure new columns exist (safe to run repeatedly)
+    await pool.query(`ALTER TABLE bank_tokens ADD COLUMN IF NOT EXISTS institution_id TEXT;`);
+    await pool.query(`ALTER TABLE bank_tokens ADD COLUMN IF NOT EXISTS institution_name TEXT;`);
+
     await pool.query(
       `CREATE INDEX IF NOT EXISTS idx_bank_tokens_user_id ON bank_tokens(user_id);`
     );
 
-    console.log("✅ Database tables are ready.");
+    console.log("✅ Database tables/columns are ready.");
   } catch (err) {
     console.error("❌ Database Init Error:", err.message);
   }
@@ -124,15 +129,12 @@ const plaidClient = new PlaidApi(configuration);
 
 /** ----------------------------
  *  Apple Universal Links (AASA)
- *  IMPORTANT: Your iOS app must include:
- *  Associated Domains: applinks:syncra-backend-2ox9.onrender.com
  *  ---------------------------- */
 const AASA_JSON = {
   applinks: {
     apps: [],
     details: [
       {
-        // TeamID.BundleID
         appID: "FYGW4LHN42.com.elilindenDinematch.Syncra",
         paths: ["/plaid/*"],
       },
@@ -146,7 +148,6 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
   res.status(200).send(JSON.stringify(AASA_JSON, null, 2));
 });
 
-// also serve at root path (nice for some validators)
 app.get("/apple-app-site-association", (req, res) => {
   res.set("Content-Type", "application/json");
   res.set("Cache-Control", "no-store");
@@ -179,7 +180,7 @@ const appleJwks = jwksClient({
   jwksUri: "https://appleid.apple.com/auth/keys",
   cache: true,
   cacheMaxEntries: 5,
-  cacheMaxAge: 10 * 60 * 1000, // 10 minutes
+  cacheMaxAge: 10 * 60 * 1000,
   rateLimit: true,
   jwksRequestsPerMinute: 10,
 });
@@ -193,9 +194,7 @@ function getAppleSigningKey(header, callback) {
 }
 
 function verifyAppleIdentityToken(identityToken) {
-  if (!APPLE_CLIENT_ID) {
-    throw new Error("Missing APPLE_CLIENT_ID");
-  }
+  if (!APPLE_CLIENT_ID) throw new Error("Missing APPLE_CLIENT_ID");
 
   return new Promise((resolve, reject) => {
     jwt.verify(
@@ -216,7 +215,6 @@ function verifyAppleIdentityToken(identityToken) {
 
 function signSyncraSession(userId) {
   if (!SYNCRA_JWT_SECRET) throw new Error("Missing SYNCRA_JWT_SECRET");
-  // 180 days is nice for small friend beta
   return jwt.sign({ sub: userId }, SYNCRA_JWT_SECRET, { expiresIn: "180d" });
 }
 
@@ -233,11 +231,6 @@ function getUserIdFromAuth(req) {
   }
 }
 
-/**
- * Auth gate for /api routes
- * - In prod: requires Bearer token
- * - In dev: allows x-user-id fallback (or default) to keep you moving fast locally
- */
 function requireUser(req, res, next) {
   const userId = getUserIdFromAuth(req);
 
@@ -246,7 +239,6 @@ function requireUser(req, res, next) {
     return next();
   }
 
-  // dev fallback
   if (!isProd) {
     const headerUser = (req.header("x-user-id") || "").trim();
     req.userId = headerUser || "syncra_user_001";
@@ -257,7 +249,7 @@ function requireUser(req, res, next) {
 }
 
 /** ----------------------------
- *  AUTH ROUTE: Exchange Apple identity token -> Syncra session token
+ *  AUTH ROUTE
  *  ---------------------------- */
 app.post("/api/auth/apple", async (req, res) => {
   try {
@@ -266,10 +258,9 @@ app.post("/api/auth/apple", async (req, res) => {
 
     const payload = await verifyAppleIdentityToken(identity_token);
 
-    const userId = payload.sub; // stable per user for your developer team
+    const userId = payload.sub;
     const email = payload.email || null;
 
-    // upsert user record
     await pool.query(
       `
       INSERT INTO users (user_id, email)
@@ -282,12 +273,7 @@ app.post("/api/auth/apple", async (req, res) => {
 
     const token = signSyncraSession(userId);
 
-    res.json({
-      success: true,
-      userId,
-      token,
-      email,
-    });
+    res.json({ success: true, userId, token, email });
   } catch (error) {
     console.error("Apple Auth Error:", error.message);
     res.status(401).json({ error: "Apple auth failed", details: error.message });
@@ -345,16 +331,41 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
   });
 }
 
+/**
+ * ✅ NEW helper:
+ * Given an access_token, resolve {institution_id, institution_name}
+ * so we can store it once at link time.
+ */
+async function resolveInstitutionInfo(accessToken) {
+  try {
+    const itemResp = await plaidClient.itemGet({ access_token: accessToken });
+    const institutionId = itemResp?.data?.item?.institution_id || null;
+
+    if (!institutionId) {
+      return { institutionId: null, institutionName: "Connected Bank" };
+    }
+
+    const instResp = await plaidClient.institutionsGetById({
+      institution_id: institutionId,
+      country_codes: ["US"],
+    });
+
+    const institutionName =
+      instResp?.data?.institution?.name || "Connected Bank";
+
+    return { institutionId, institutionName };
+  } catch (e) {
+    return { institutionId: null, institutionName: "Connected Bank" };
+  }
+}
+
 /** ----------------------------
  *  Routes
  *  ---------------------------- */
-
-// Quick root ping
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "syncra-backend" });
 });
 
-// Protect all /api/* EXCEPT /api/auth/apple
 app.use("/api", (req, res, next) => {
   if (req.path === "/auth/apple") return next();
   return requireUser(req, res, next);
@@ -383,7 +394,7 @@ app.get("/api/create_link_token", async (req, res) => {
   }
 });
 
-// B. Exchange public_token -> access_token (SAVES to Database)
+// B. Exchange public_token -> access_token (SAVES to Database + stores institution name)
 app.post("/api/exchange_public_token", async (req, res) => {
   try {
     const userId = req.userId;
@@ -394,15 +405,22 @@ app.post("/api/exchange_public_token", async (req, res) => {
     const response = await plaidClient.itemPublicTokenExchange({ public_token });
     const newToken = response.data.access_token;
 
+    // ✅ Resolve institution info once, store it.
+    const { institutionId, institutionName } = await resolveInstitutionInfo(newToken);
+
     await pool.query(
-      `INSERT INTO bank_tokens (user_id, access_token)
-       VALUES ($1, $2)
-       ON CONFLICT (access_token) DO NOTHING`,
-      [userId, newToken]
+      `
+      INSERT INTO bank_tokens (user_id, access_token, institution_id, institution_name)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (access_token) DO NOTHING
+      `,
+      [userId, newToken, institutionId, institutionName]
     );
 
-    console.log(`✅ New bank linked for user=${userId} and saved to DB.`);
-    res.json({ success: true });
+    console.log(
+      `✅ New bank linked for user=${userId} stored institution="${institutionName}"`
+    );
+    res.json({ success: true, institutionName });
   } catch (error) {
     const details = error?.response?.data || error.message;
     console.error("Exchange Error:", details);
@@ -504,7 +522,7 @@ app.get("/api/accounts", async (req, res) => {
   }
 });
 
-// E. Health Check (scoped to the current user)
+// E. Health Check
 app.get("/api/status", async (req, res) => {
   try {
     const userId = req.userId;
@@ -537,45 +555,28 @@ app.post("/api/unlink", async (req, res) => {
 });
 
 /** ----------------------------
- *  NEW: Connected Banks list + delete
- *  These power your iOS:
- *   - GET /api/institutions
- *   - POST /api/delete_institution { index: Int }
+ *  Connected Banks list + delete
  *  ---------------------------- */
 
-// G. List connected banks for the current user
+// G. List connected banks (now uses stored institution_name)
 app.get("/api/institutions", async (req, res) => {
   try {
     const userId = req.userId;
 
     const result = await pool.query(
-      "SELECT id, access_token FROM bank_tokens WHERE user_id = $1 ORDER BY created_at DESC",
+      `
+      SELECT id, institution_name
+      FROM bank_tokens
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      `,
       [userId]
     );
 
-    if (result.rows.length === 0) return res.json({ institutions: [] });
-
-    const institutions = await Promise.all(
-      result.rows.map(async (row) => {
-        try {
-          const itemResp = await plaidClient.itemGet({ access_token: row.access_token });
-          const instId = itemResp.data.item.institution_id;
-
-          let name = "Connected Bank";
-          if (instId) {
-            const instResp = await plaidClient.institutionsGetById({
-              institution_id: instId,
-              country_codes: ["US"],
-            });
-            name = instResp.data.institution?.name || name;
-          }
-
-          return { id: row.id, name };
-        } catch {
-          return { id: row.id, name: "Connected Bank" };
-        }
-      })
-    );
+    const institutions = (result.rows || []).map((r) => ({
+      id: r.id,
+      name: r.institution_name || "Connected Bank",
+    }));
 
     res.json({ institutions });
   } catch (error) {

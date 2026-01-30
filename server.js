@@ -6,6 +6,7 @@
  * - Paginates Plaid transactions so you don’t silently miss results
  * - Uses newer Plaid personal_finance_category when available
  * - Sorts merged transactions by date desc
+ * - Adds Plaid OAuth redirect page + AASA config for Universal Links
  */
 
 require("dotenv").config();
@@ -34,8 +35,6 @@ app.use(express.json({ limit: "1mb" }));
  *  Helpers
  *  ---------------------------- */
 function getUserId(req) {
-  // Until you add auth, this is a clean way to test multiple users.
-  // You can pass a header: x-user-id: someUser123
   return (req.header("x-user-id") || "syncra_user_001").trim();
 }
 
@@ -50,7 +49,6 @@ function requireEnv(name) {
  *  ---------------------------- */
 const isProd = process.env.NODE_ENV === "production";
 
-// Render typically needs SSL; local dev often does NOT.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: isProd ? { rejectUnauthorized: false } : false,
@@ -68,7 +66,9 @@ async function initDb() {
         UNIQUE (access_token)
       );
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bank_tokens_user_id ON bank_tokens(user_id);`);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_bank_tokens_user_id ON bank_tokens(user_id);`
+    );
     console.log("✅ Database table 'bank_tokens' is ready.");
   } catch (err) {
     console.error("❌ Database Init Error:", err.message);
@@ -82,9 +82,9 @@ initDb();
 try {
   requireEnv("PLAID_CLIENT_ID");
   requireEnv("PLAID_SECRET");
+  requireEnv("PLAID_ENV");
+  requireEnv("PLAID_REDIRECT_URI");
 } catch (e) {
-  // Don’t crash on boot in case you're deploying and setting env later,
-  // but DO make it obvious in logs.
   console.error("❌ ENV CONFIG ERROR:", e.message);
 }
 
@@ -97,7 +97,6 @@ const configuration = new Configuration({
     headers: {
       "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID || "",
       "PLAID-SECRET": process.env.PLAID_SECRET || "",
-      // Optional but recommended — set if you want:
       ...(process.env.PLAID_VERSION ? { "Plaid-Version": process.env.PLAID_VERSION } : {}),
     },
   },
@@ -107,6 +106,8 @@ const plaidClient = new PlaidApi(configuration);
 
 /** ----------------------------
  *  Apple Universal Links (AASA)
+ *  IMPORTANT: Your iOS app must include:
+ *  Associated Domains: applinks:syncra-backend-2ox9.onrender.com
  *  ---------------------------- */
 app.get("/.well-known/apple-app-site-association", (req, res) => {
   res.set("Content-Type", "application/json");
@@ -118,7 +119,7 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
           details: [
             {
               appID: "FYGW4LHN42.com.elilindenDinematch.Syncra",
-              paths: ["/*"],
+              paths: ["/plaid/*"],
             },
           ],
         },
@@ -130,10 +131,30 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
 });
 
 /** ----------------------------
+ *  Plaid OAuth redirect landing page
+ *  Your PLAID_REDIRECT_URI should be:
+ *  https://syncra-backend-2ox9.onrender.com/plaid/oauth.html
+ *  ---------------------------- */
+app.get("/plaid/oauth.html", (req, res) => {
+  res.set("Content-Type", "text/html; charset=utf-8");
+  res.status(200).send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Syncra</title>
+  </head>
+  <body style="font-family: -apple-system, system-ui, Arial; padding: 24px;">
+    <h3>Returning to Syncra…</h3>
+    <p>If you aren’t redirected automatically, close this page and return to the app.</p>
+  </body>
+</html>`);
+});
+
+/** ----------------------------
  *  Plaid helpers
  *  ---------------------------- */
 async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
-  // Plaid returns max 500 per page depending on endpoint versions; using 100 is safe.
   const pageSize = 100;
   let offset = 0;
   let allTransactions = [];
@@ -147,7 +168,6 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
       options: { count: pageSize, offset },
     });
 
-    // Map accounts -> name/mask for enrichment
     for (const acc of resp.data.accounts || []) {
       accountsMap[acc.account_id] = acc;
     }
@@ -160,7 +180,6 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
     offset += pageSize;
   }
 
-  // Enrich
   const enriched = allTransactions.map((t) => {
     const account = accountsMap[t.account_id];
 
@@ -173,7 +192,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
       id: t.transaction_id,
       merchantName: t.merchant_name || t.name,
       amount: t.amount,
-      date: t.date, // YYYY-MM-DD
+      date: t.date,
       pending: !!t.pending,
       category,
       accountName: account ? account.official_name || account.name : "Unknown",
@@ -205,12 +224,8 @@ app.get("/api/create_link_token", async (req, res) => {
       products: ["transactions"],
       country_codes: ["US"],
       language: "en",
+      redirect_uri: process.env.PLAID_REDIRECT_URI,
     };
-
-    // Only include redirect_uri if you set it
-    if (process.env.PLAID_REDIRECT_URI) {
-      createArgs.redirect_uri = process.env.PLAID_REDIRECT_URI;
-    }
 
     const response = await plaidClient.linkTokenCreate(createArgs);
     res.json({ link_token: response.data.link_token });
@@ -250,7 +265,7 @@ app.post("/api/exchange_public_token", async (req, res) => {
   }
 });
 
-// C. Get Transactions (FETCHES from Database + paginates Plaid)
+// C. Get Transactions
 app.get("/api/transactions", async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -286,7 +301,6 @@ app.get("/api/transactions", async (req, res) => {
 
     let merged = perTokenResults.flat();
 
-    // Sort by date desc (and stable-ish by amount)
     merged.sort((a, b) => {
       if (a.date === b.date) return (b.amount || 0) - (a.amount || 0);
       return a.date < b.date ? 1 : -1;
@@ -303,7 +317,7 @@ app.get("/api/transactions", async (req, res) => {
   }
 });
 
-// D. Get Accounts (FETCHES from Database)
+// D. Get Accounts
 app.get("/api/accounts", async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -365,7 +379,7 @@ app.get("/api/status", async (req, res) => {
   }
 });
 
-// F. Unlink All (Wipes DB for this user)
+// F. Unlink All
 app.post("/api/unlink", async (req, res) => {
   try {
     const userId = getUserId(req);

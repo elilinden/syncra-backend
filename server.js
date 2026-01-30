@@ -4,6 +4,7 @@
  * - Issues Syncra JWT sessions
  * - Uses JWT user_id to scope Plaid tokens per user
  * - Keeps your existing Plaid + AASA + OAuth redirect page behavior
+ * - Adds: /api/institutions + /api/delete_institution for your Settings “Connected Banks”
  */
 
 require("dotenv").config();
@@ -193,7 +194,6 @@ function getAppleSigningKey(header, callback) {
 
 function verifyAppleIdentityToken(identityToken) {
   if (!APPLE_CLIENT_ID) {
-    // In prod this should never happen because we requireEnv above.
     throw new Error("Missing APPLE_CLIENT_ID");
   }
 
@@ -533,6 +533,77 @@ app.post("/api/unlink", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Failed to unlink banks", details: err.message });
+  }
+});
+
+/** ----------------------------
+ *  NEW: Connected Banks list + delete
+ *  These power your iOS:
+ *   - GET /api/institutions
+ *   - POST /api/delete_institution { index: Int }
+ *  ---------------------------- */
+
+// G. List connected banks for the current user
+app.get("/api/institutions", async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    const result = await pool.query(
+      "SELECT id, access_token FROM bank_tokens WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+
+    if (result.rows.length === 0) return res.json({ institutions: [] });
+
+    const institutions = await Promise.all(
+      result.rows.map(async (row) => {
+        try {
+          const itemResp = await plaidClient.itemGet({ access_token: row.access_token });
+          const instId = itemResp.data.item.institution_id;
+
+          let name = "Connected Bank";
+          if (instId) {
+            const instResp = await plaidClient.institutionsGetById({
+              institution_id: instId,
+              country_codes: ["US"],
+            });
+            name = instResp.data.institution?.name || name;
+          }
+
+          return { id: row.id, name };
+        } catch {
+          return { id: row.id, name: "Connected Bank" };
+        }
+      })
+    );
+
+    res.json({ institutions });
+  } catch (error) {
+    const details = error?.response?.data || error.message;
+    console.error("Institutions Error:", details);
+    res.status(500).json({ error: "Failed to load institutions", details });
+  }
+});
+
+// H. Delete one connected bank by DB row id
+app.post("/api/delete_institution", async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { index } = req.body || {};
+    if (typeof index !== "number") return res.status(400).json({ error: "Missing index" });
+
+    const del = await pool.query(
+      "DELETE FROM bank_tokens WHERE user_id = $1 AND id = $2 RETURNING id",
+      [userId, index]
+    );
+
+    if (del.rowCount === 0) return res.status(404).json({ error: "Not found" });
+
+    res.json({ success: true });
+  } catch (error) {
+    const details = error?.response?.data || error.message;
+    console.error("Delete Institution Error:", details);
+    res.status(500).json({ error: "Failed to delete institution", details });
   }
 });
 

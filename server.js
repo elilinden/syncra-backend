@@ -26,7 +26,7 @@ const app = express();
  * This MUST be exactly: TEAMID.BUNDLEID
  * Example: FYGW4LHN42.com.elilinden.syncra
  */
-const AASA_APP_ID = "FYGW4LHN42.com.YOUR_BUNDLE_ID_HERE";
+const AASA_APP_ID = "FYGW4LHN42.com.elilindenDinematch.Syncra";
 
 /** ----------------------------
  *  Basic middleware

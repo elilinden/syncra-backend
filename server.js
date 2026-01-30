@@ -19,13 +19,23 @@ const { Pool } = require("pg");
 const app = express();
 
 /** ----------------------------
+ *  CONFIG YOU MUST SET
+ *  ---------------------------- */
+/**
+ * IMPORTANT:
+ * This MUST be exactly: TEAMID.BUNDLEID
+ * Example: FYGW4LHN42.com.elilinden.syncra
+ */
+const AASA_APP_ID = "FYGW4LHN42.com.YOUR_BUNDLE_ID_HERE";
+
+/** ----------------------------
  *  Basic middleware
  *  ---------------------------- */
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",") : "*",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-user-id"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-user-id"],
   })
 );
 
@@ -106,11 +116,13 @@ const plaidClient = new PlaidApi(configuration);
 
 /** ----------------------------
  *  Apple Universal Links (AASA)
- *  IMPORTANT: Your iOS app must include:
+ *  IMPORTANT: iOS app must include:
  *  Associated Domains: applinks:syncra-backend-2ox9.onrender.com
  *  ---------------------------- */
-app.get("/.well-known/apple-app-site-association", (req, res) => {
+function sendAASA(res) {
+  // Apple prefers application/json and a 200
   res.set("Content-Type", "application/json");
+  res.set("Cache-Control", "no-store");
   res.status(200).send(
     JSON.stringify(
       {
@@ -118,7 +130,7 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
           apps: [],
           details: [
             {
-              appID: "FYGW4LHN42.com.elilindenDinematch.Syncra",
+              appID: AASA_APP_ID,
               paths: ["/plaid/*"],
             },
           ],
@@ -128,7 +140,11 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
       2
     )
   );
-});
+}
+
+// Serve at BOTH common AASA locations
+app.get("/.well-known/apple-app-site-association", (req, res) => sendAASA(res));
+app.get("/apple-app-site-association", (req, res) => sendAASA(res));
 
 /** ----------------------------
  *  Plaid OAuth redirect landing page
@@ -137,6 +153,7 @@ app.get("/.well-known/apple-app-site-association", (req, res) => {
  *  ---------------------------- */
 app.get("/plaid/oauth.html", (req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
+  res.set("Cache-Control", "no-store");
   res.status(200).send(`<!doctype html>
 <html>
   <head>
@@ -158,7 +175,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
   const pageSize = 100;
   let offset = 0;
   let allTransactions = [];
-  let accountsMap = {};
+  const accountsMap = {};
 
   while (true) {
     const resp = await plaidClient.transactionsGet({
@@ -180,7 +197,7 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
     offset += pageSize;
   }
 
-  const enriched = allTransactions.map((t) => {
+  return allTransactions.map((t) => {
     const account = accountsMap[t.account_id];
 
     const category =
@@ -200,8 +217,6 @@ async function fetchAllTransactionsForToken(accessToken, startDate, endDate) {
       accountType: account ? account.type : undefined,
     };
   });
-
-  return enriched;
 }
 
 /** ----------------------------
@@ -299,7 +314,7 @@ app.get("/api/transactions", async (req, res) => {
       })
     );
 
-    let merged = perTokenResults.flat();
+    const merged = perTokenResults.flat();
 
     merged.sort((a, b) => {
       if (a.date === b.date) return (b.amount || 0) - (a.amount || 0);
@@ -407,5 +422,7 @@ process.on("SIGTERM", async () => {
  *  ---------------------------- */
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(`🚀 Syncra Backend running on port ${PORT} (env=${plaidEnv}, prod=${isProd})`);
+  console.log(
+    `🚀 Syncra Backend running on port ${PORT} (plaidEnv=${plaidEnv}, prod=${isProd})`
+  );
 });
